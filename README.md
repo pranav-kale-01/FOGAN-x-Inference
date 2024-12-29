@@ -1,4 +1,4 @@
-## Steps to run the cod e
+## Steps to run the code
 
 1. Install required libraries through `requirements.txt`
 
