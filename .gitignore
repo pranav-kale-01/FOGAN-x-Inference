@@ -1,0 +1,10 @@
+input/*.png
+saved_models/*.pt
+val_outputs/*.png
+hd_model/*
+*.png
+*.jpg
+*.webm
+*.avi
+*.mp4
+__pycache__/*
