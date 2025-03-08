@@ -1,253 +1,155 @@
-import torch 
-import cv2
-from PIL import Image
-import torchvision.transforms as transforms 
+import threading
+import queue
 import time
-from torchvision.utils import save_image
-from generator import GeneratorResNet
-import os
+import cv2
+import torch
 import numpy as np
-import scipy.misc
-import imutils
-from PIL import Image
+from collections import deque
+from generator import GeneratorResNet
+from concurrent.futures import ThreadPoolExecutor
 
-protopath = "./hd_model/MobileNetSSD_deploy.prototxt"
-modelpath = "./hd_model/MobileNetSSD_deploy.caffemodel"
-detector = cv2.dnn.readNetFromCaffe(protopath, modelpath)
+# -------------------- QUEUES & EVENTS --------------------
+frame_queue = queue.Queue(maxsize=10)   # Stores frames for processing
+result_queue = queue.Queue(maxsize=20)       # Stores processed frames for display
+stop_event = threading.Event()          # Used to signal threads to stop
 
-CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
-           "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
-           "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
-           "sofa", "train", "tvmonitor"]
+TARGET_FPS=30
+FRAME_INTERVAL = 1.0 / TARGET_FPS  # 1/30 = 0.033s per frame
 
-
-def infer_export_video( video_name ): 
-    is_GPU = torch.cuda.is_available() 
-        
-    if( not is_GPU ):
-        loaded_weights = torch.load('./saved_models/generator.pt' , map_location=torch.device('cpu') )
-    else: 
-        loaded_weights = torch.load('./saved_models/generator.pt')
-
+# -------------------- MODEL LOADING --------------------
+def load_model():
+    print("DEBUG: [Model] Loading model...")
     model = GeneratorResNet(input_nc=3, output_nc=3, ngf=64, n_blocks=4, img_size=512, light=True)
-    model.load_state_dict( loaded_weights )
-    model.eval() 
-    model.to("cuda") if is_GPU else model.to("cpu")
+    model.load_state_dict(torch.load('./saved_models/generator.pt', map_location="cuda"))
+    model.eval().to("cuda")
+    print("DEBUG: [Model] Model loaded successfully!")
+    return model
+
+# -------------------- FRAME PREPROCESSING --------------------
+def preprocess_frame(frame):
+    """ Convert OpenCV frame to PyTorch tensor. """
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
+    frame_resized = cv2.resize(frame_rgb, (512, 512))   # Resize to 512x512
+    img_tensor = torch.tensor(frame_resized / 255.0, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)  # Normalize & reshape
+    img_tensor = img_tensor.to("cuda")
+    print("DEBUG: [Preprocess] Frame converted to tensor.")
+    return img_tensor
+
+# -------------------- POSTPROCESSING --------------------
+def postprocess_frame(input_tensor, output_tensor):
+    """ Convert model output tensor to OpenCV image. """
+    input_img = input_tensor[0].cpu().numpy().transpose(1, 2, 0)  # Convert to (H, W, 3)
+    output_img = output_tensor[0].cpu().detach().numpy().transpose(1, 2, 0)  # Convert model output
+
+    if input_img.shape[0] == 3:  # Shape is (3, H, W)
+        input_tensor = np.transpose(input_img, (1, 2, 0))
+    if output_img.shape[0] == 3:  # Shape is (3, H, W)
+        output_img = np.transpose(output_img, (1, 2, 0))
+
+    # Convert to OpenCV format
+    input_img = cv2.cvtColor(input_img, cv2.COLOR_RGB2BGR)
+    output_img = cv2.cvtColor(output_img, cv2.COLOR_RGB2BGR)
+
+    combined = np.hstack((input_img, output_img))  # Side-by-side view
+    print("DEBUG: [Postprocess] Frames combined successfully.")
+    return combined
+
+# -------------------- INFERENCE WORKER --------------------
+def infer_worker(model):
+    """ Worker thread that processes frames from frame_queue. """
+    print("DEBUG: [Worker] Inference worker started.")
     
+    while not stop_event.is_set():
+        try:
+            frame = frame_queue.get(timeout=0.05)
+            print("DEBUG: [Worker] Frame pulled from queue.")
+        except queue.Empty:
+            continue  
 
-    # loading the video 
-    cam = cv2.VideoCapture(video_name)
-  
-    transform = transforms.Compose([ 
-        transforms.Resize((512, 512)),
-        transforms.ToTensor() 
-    ]) 
+        start_time = time.time()  # Track inference start time
+        img_tensor = preprocess_frame(frame)
 
-    try: 
-        if not os.path.exists("data"):
-            os.makedirs('data')
-            
-        # Get the video's width, height, and FPS for the output video
-        fps = 30
-        
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter('output_video.mp4', fourcc, fps, (800, 800))
+        with torch.no_grad():
+            output_tensor = model(img_tensor)
+            if isinstance(output_tensor, tuple):
+                output_tensor = output_tensor[0]  
 
-        # frames 
-        currentframe = 0 
-        while( True ): 
-            ret, frame = cam.read()
+        result_queue.put(postprocess_frame(img_tensor.cpu(), output_tensor.cpu()))  
+        print(f"DEBUG: [Worker] Inference complete in {time.time() - start_time:.4f}s")
 
-            if ret: 
-                if( currentframe <= 300):
-                    start_time = time.time()
+        frame_queue.task_done()  
 
-                    with torch.no_grad():    
-                        img_tensor = transform( Image.fromarray(np.array(frame)[:,:,::-1]) ).unsqueeze(0)
-                        
-                        # loading to either gpu or cpu based on what is selected
-                        img_tensor = img_tensor.cuda() if is_GPU else img_tensor.cpu()
-                        output = model( img_tensor ) 
-                        
-                    
-                        save_image( img_tensor, f"val_outputs/in.png", normalize=True)
-                        save_image( output[0], f"val_outputs/out.png", normalize=True)
-                        end_time = time.time()
+    print("DEBUG: [Worker] Inference worker stopped.")
 
-                        print("Current Frame - ", currentframe )
-                        print( "Inference time - ", (end_time - start_time ) ) 
+# -------------------- DISPLAY WORKER --------------------
+def show_side_by_side():
+    """ Displays processed frames side by side. """
+    print("DEBUG: [Display] Display worker started.")
+    last_display_time = time.time()
 
-                        frame =  cv2.imread("val_outputs/out.png")
-                        frame = imutils.resize(frame, width=800)
+    while not stop_event.is_set():
+        try:
+            img = result_queue.get(timeout=1)
+            print("DEBUG: [Display] Frame pulled from result queue.")
+        except queue.Empty:
+            continue  
 
-                        (H, W) = frame.shape[:2]
-                        blob = cv2.dnn.blobFromImage(frame, 0.007843, (W, H), 127.5)
-                        
-                        detector.setInput(blob)
-                        person_detections = detector.forward()
+        current_time = time.time()
+        time_since_last_frame = current_time - last_display_time
 
-                        for i in np.arange(0, person_detections.shape[2]):
-                            confidence = person_detections[0, 0, i, 2]
-                            if confidence > 0.5:
-                                idx = int(person_detections[0, 0, i, 1])
-                                if CLASSES[idx] != "person":
-                                    continue
-                                
-                                person_box = person_detections[0, 0, i, 3:7] * np.array([W, H, W, H])
-                                (startX, startY, endX, endY) = person_box.astype("int")
-                                cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 0, 255), 2)
-                        cv2.imwrite("bounded.jpg",frame)
-                        
-                        # Ensure dimensions are consistent
-                        assert frame.shape[1] == 800 and frame.shape[0] == 800, "Frame dimensions are incorrect!"
+        # Ensure ~30 FPS by waiting if needed
+        if time_since_last_frame < FRAME_INTERVAL:
+            time.sleep(FRAME_INTERVAL - time_since_last_frame)
 
-                        # Write the processed frame to the video
-                        out.write(frame)
-                
+        cv2.imshow("Processed Video", img)
+        last_display_time = time.time()
 
-                currentframe += 1
-            else: 
-                break
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("DEBUG: [Display] 'q' pressed. Stopping display.")
+            stop_event.set()
 
-    except OSError: 
-        print("Error: Creaint directory of data")
-
-    cam.release()
-    out.release() # releasing the VideoWriter object
     cv2.destroyAllWindows()
+    print("DEBUG: [Display] Display worker stopped.")
 
-# video_name = '/content/drive/MyDrive/video.mp4'
-def infer_video( video_name ):
-    is_GPU = torch.cuda.is_available() 
-        
-    if( not is_GPU ):
-        loaded_weights = torch.load('./saved_models/generator.pt' , map_location=torch.device('cpu') )
-    else: 
-        loaded_weights = torch.load('./saved_models/generator.pt')
+# -------------------- MAIN FUNCTION --------------------
+def main():
+    print("DEBUG: [Main] Starting video processing...")
+    model = load_model()  
 
-    model = GeneratorResNet(input_nc=3, output_nc=3, ngf=64, n_blocks=4, img_size=512, light=True)
-    model.load_state_dict( loaded_weights )
-    model.eval() 
-    model.to("cuda") if is_GPU else model.to("cpu")
-    
+    cam = cv2.VideoCapture("./videos/smoky_video.mp4")
 
-    # loading the video 
-    cam = cv2.VideoCapture(video_name)
-    # cam = cv2.VideoCapture(0)
-    transform = transforms.Compose([ 
-        transforms.Resize((512, 512)),
-        transforms.ToTensor() 
-    ]) 
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        executor.submit(infer_worker, model)  
+        executor.submit(infer_worker, model)  
+        executor.submit(show_side_by_side)    
 
-    try: 
-        if not os.path.exists("data"):
-            os.makedirs('data')
+        try:
+            while cam.isOpened():
+                ret, frame = cam.read()
+                if not ret:
+                    print("DEBUG: [Main] End of video reached.")
+                    break
 
-        # frames 
-        currentframe = 0 
-        while( True ): 
-            ret, frame = cam.read()
+                # Ensure we process every frame
+                while frame_queue.full():
+                    print("DEBUG: [Main] Queue full. Waiting for space...")
 
-            if ret: 
-                if( currentframe > 4 and currentframe % 4 == 0 ):
-                    start_time = time.time()
+                frame_queue.put(frame)
+                print(f"DEBUG: [Main] Frame added to queue (Queue Size: {frame_queue.qsize()})")
 
-                    with torch.no_grad():    
-                        img_tensor = transform( Image.fromarray(np.array(frame)[:,:,::-1]) ).unsqueeze(0)
-                        
-                        # loading to either gpu or cpu based on what is selected
-                        img_tensor = img_tensor.cuda() if is_GPU else img_tensor.cpu()
-                        output = model( img_tensor ) 
+        except KeyboardInterrupt:
+            print("DEBUG: [Main] KeyboardInterrupt detected, stopping...")
+            stop_event.set()  
 
-                        
-                        save_image( img_tensor, f"val_outputs/in.png", normalize=True)
-                        save_image( output[0], f"val_outputs/out.png", normalize=True)
-                        end_time = time.time()
-                        print( "Inference time - ", (end_time - start_time ) ) 
+        finally:
+            cam.release()
+            print("DEBUG: [Main] Video processing stopped.")
 
-                        frame =  cv2.imread("val_outputs/out.png")
-                        frame = imutils.resize(frame, width=800)
+            # ---- FIX: Wait for workers to finish before exiting ----
+            frame_queue.join()  
+            result_queue.join()  
+            stop_event.set()  
+            time.sleep(1)  # Let threads finish
 
-                        (H, W) = frame.shape[:2]
-                        blob = cv2.dnn.blobFromImage(frame, 0.007843, (W, H), 127.5)
-                        
-                        detector.setInput(blob)
-                        person_detections = detector.forward()
-
-                        for i in np.arange(0, person_detections.shape[2]):
-                            confidence = person_detections[0, 0, i, 2]
-                            if confidence > 0.5:
-                                idx = int(person_detections[0, 0, i, 1])
-                                if CLASSES[idx] != "person":
-                                    continue
-                                
-                                person_box = person_detections[0, 0, i, 3:7] * np.array([W, H, W, H])
-                                (startX, startY, endX, endY) = person_box.astype("int")
-                                cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 0, 255), 2)
-                        cv2.imwrite("bounded.jpg",frame)
-                        # frame = cv2.imread("val_outputs/out.png")
-                        # # frame = frame.transpose((2, 3, 1, 0)).reshape((512, 512, 3))
-
-                        # frame = imutils.resize(frame,width=512)
-                       
-                        # (H,W) = frame.shape[:2]
-                       
-                        # blob = cv2.dnn.blobFromImage(frame,0.007843,(W,H),127.5)
-                        # # cv2.imshow()
-                        # detector.setInput(blob)
-                        # person_detections = detector.forward()
-                        # for i in np.arange(0, person_detections.shape[2]):
-                        #     confidence = person_detections[0, 0, i, 2]
-                        #     if confidence > 0.5:
-                        #         idx = int(person_detections[0, 0, i, 1])
-                        #         if CLASSES[idx] != "person":
-                        #             continue
-                                
-                        #         person_box = person_detections[0, 0, i, 3:7] * np.array([W, H, W, H])
-                        #         (startX, startY, endX, endY) = person_box.astype("int")
-                        #         cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 0, 255), 2)
-                        #         print("Person Detected")
-
-                        #     cv2.imshow("App",frame)
-                        #     cv2.waitKey(0)
-
-
-                        #     cv2.destroyAllWindows()
-
-                currentframe += 1
-            else: 
-                break
-
-    except OSError: 
-        print("Error: Creaint directory of data")
-
-    cam.release()
-    cv2.destroyAllWindows()
-
-def infer_image( img_name ):    
-    try: 
-        loaded_weights = torch.load('./saved_models/generator.pt') #, map_location=torch.device('cpu') )
-        transform = transforms.Compose([ 
-            transforms.Resize((512, 512)),
-            transforms.ToTensor() 
-        ])     
-
-        model = GeneratorResNet(input_nc=3, output_nc=3, ngf=64, n_blocks=4, img_size=512, light=True)
-        model.load_state_dict( loaded_weights )
-        model.to("cuda")
-        model.eval()
-
-        start_time = time.time()
-        img_tensor =  transform( Image.fromarray(np.array(Image.open(f"./input/{img_name}.png"))[:,:,::-1]) ).unsqueeze(0).cuda()
-        output = model( img_tensor ) 
-        save_image( img_tensor, f"val_outputs/{img_name}_in.png", normalize=True)
-        save_image( output[0], f"val_outputs/{img_name}_out.png", normalize=True)
-        end_time = time.time()
-
-        print( "Inference time - ", (end_time - start_time ) ) 
-
-    except Exception as e: 
-        print("error", e )
-        
-infer_export_video("./videos/prev.mp4")
-    
+if __name__ == "__main__":
+    main()

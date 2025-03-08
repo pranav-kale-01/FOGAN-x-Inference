@@ -8,3 +8,4 @@ hd_model/*
 *.avi
 *.mp4
 __pycache__/*
+venv3-10/*
