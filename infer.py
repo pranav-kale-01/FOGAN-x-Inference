@@ -249,5 +249,5 @@ def infer_image( img_name ):
     except Exception as e: 
         print("error", e )
         
-infer_export_video("./videos/prev.mp4")
-    
+# infer_export_video("./videos/prev.mp4")
+infer_image("19_3_0.9039")
